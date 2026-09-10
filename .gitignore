@@ -1,0 +1,15 @@
+# Build and IDE output
+**/bin/
+**/obj/
+.vs/
+
+# Contributor-specific game and Pulsar locations
+**/Directory.Build.props.user
+*.user
+
+# Logs and local deployment output
+*.log
+Pulsar/
+Local/
+Legacy/
+Interim/

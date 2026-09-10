@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PluginData xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="GitHubPlugin">
+  <Id>DB0C2D17-9642-4B33-BD5E-96334E20144C</Id>
+  <RepoId>local/realistic-acs</RepoId>
+  <FriendlyName>Realistic ACS</FriendlyName>
+  <Author>Realistic ACS contributors</Author>
+  <Tooltip>Client-side finite RCS and thruster-leverage attitude-control prototype.</Tooltip>
+  <Description>Client-side Realistic ACS prototype. Finite ion and hydrogen RCS clusters, ordinary-thruster leverage, persistent rotational inertia, and inertial-dampener-following rotational arrest. Use /acs arm or /acs disarm for master control. Not multiplayer-safe: this build applies local physics only.</Description>
+  <SourceDirectories>
+    <Directory>ClientPlugin</Directory>
+  </SourceDirectories>
+  <Commit>source-distribution</Commit>
+</PluginData>

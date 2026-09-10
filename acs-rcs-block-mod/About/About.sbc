@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<MyObjectBuilder_ModInfo xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <Name>Realistic ACS - RCS Blocks</Name>
+  <Description>Content companion for the Realistic ACS client plugin. Adds finite ion and hydrogen RCS-cluster blocks with animated gimbals. Requires the Realistic ACS Pulsar plugin for attitude-control authority; client-side prototype only.</Description>
+</MyObjectBuilder_ModInfo>

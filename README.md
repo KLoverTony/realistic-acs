@@ -49,4 +49,3 @@ The plugin allocates each working pod's finite force according to its position r
 ## Sharing and development hygiene
 
 Do not commit `bin/`, `obj/`, local `Directory.Build.props.user` files, logs, or deployed Pulsar folders. The included `.gitignore` covers these items.
-
