@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -9,6 +10,7 @@ using Sandbox.Game.World;
 using MyAPIGateway = Sandbox.ModAPI.MyAPIGateway;
 using Sandbox.ModAPI.Ingame;
 using VRage.Game.Entity;
+using VRage.FileSystem;
 using VRage.Plugins;
 using VRage.Utils;
 using VRageMath;
@@ -36,6 +38,13 @@ public sealed class Plugin : IPlugin
     private bool attitudeControlArmed = true;
     private long attitudeControlGridId;
     private readonly Dictionary<long, RcsVisualState> rcsVisualStates = new();
+    private readonly Dictionary<long, HydrogenOverrideState> hydrogenOverrides = new();
+    private long hydrogenOverrideGridId;
+    private readonly Dictionary<long, GridActuatorCache> actuatorCaches = new();
+    private readonly ControlAllocationCache attitudeAllocationCache = new();
+    private readonly ControlAllocationCache dampeningAllocationCache = new();
+    private readonly ControlAllocationCache overrideCounterAllocationCache = new();
+    private readonly Dictionary<long, AlwaysOnGridRegistration> alwaysOnGrids = new();
     private Dictionary<long, Vector3D> rcsVisualAllocatedForces = new();
     private long rcsVisualAllocationGridId;
     private bool rcsTiltDiagnosticActive;
@@ -101,14 +110,32 @@ public sealed class Plugin : IPlugin
     // incorrect cross-axis rotation.  The diagnostic still reports the
     // allocation, but live physics requires a reasonably aligned torque.
     private const double RcsMinimumTorqueAlignment = 0.85;
+    // Vanilla-thruster geometry is used as a virtual attitude actuator model,
+    // rather than writing native thrust overrides. Only an effectively pure
+    // virtual couple is eligible, so the model never implies unaccounted-for
+    // translation while it applies simulated attitude torque.
+    private const double MaximumTranslationResidualRatio = 0.02;
+    private const long ActuatorCacheRefreshFrames = 30;
+    private const long AllocationSolveIntervalFrames = 6;
+    private const long AlwaysOnValidationFrames = 3600;
+    private const int MaximumAlwaysOnGrids = 16;
+    private const double AllocationInputChangeThresholdPercent = 0.25;
+    private const int MaximumVanillaAllocationIterations = 96;
+    private const long LifecycleLogFlushFrames = 120;
+    private const long LifecycleLogMaximumBytes = 1024 * 1024;
+    private static readonly ConcurrentQueue<string> PendingLifecycleLogLines = new();
+    private static readonly object LifecycleLogFileLock = new();
+    private static string lifecycleLogPath;
+    private static int lifecycleLogFlushScheduled;
     private const float RcsAxisDiagnosticRadians = MathHelper.Pi / 9f; // 20 degrees
     private const double RawRotationIndicatorFullScale = 9.0;
     private const double PilotInputMaximumTorquePercent = 25.0;
     // Initial motion test: sufficiently strong to see on a test grid, while
     // remaining bounded by the emergency angular-speed cutoff below.
     private const double LiveAttitudeTorqueScale = 1.00;
-    // Vanilla engines are the coarse, high-authority source. Their calculated
-    // r x F contribution is added without overriding translation thrust.
+    // Vanilla engines are the coarse, high-authority *virtual* source. Their
+    // geometry supplies simulated r x F authority without altering translation
+    // thrust, player input, or native thruster overrides.
     private const double VanillaAttitudeTorqueScale = 1.00;
     // Damping uses the same full allocated authority as pilot rotation. Its
     // requested torque still tapers proportionally with angular velocity.
@@ -123,7 +150,8 @@ public sealed class Plugin : IPlugin
     public void Init(object gameInstance)
     {
         Instance = this;
-        const string message = "Combined vanilla-thruster and finite RCS control, persistent rotational inertia, and inertial-dampener-following rotational arrest are enabled by default for every player-controlled grid. A 2.00 rad/s emergency angular-speed cutoff is active.";
+        InitializeLifecycleLogPath();
+        const string message = "Finite RCS plus virtual vanilla-thruster-geometry attitude control, persistent rotational inertia, and inertial-dampener-following rotational arrest are enabled by default for every player-controlled grid. A 2.00 rad/s emergency angular-speed cutoff is active.";
         MyLog.Default.WriteLine($"[{Name}] {message}");
         WriteLifecycleLog(message);
     }
@@ -143,10 +171,14 @@ public sealed class Plugin : IPlugin
         }
 
         RestoreExperimentalOverrides("plugin unload");
+        RestoreHydrogenRcsOverrides("plugin unload");
         RestoreAngularDamping("plugin unload");
+        RestoreAlwaysOnAngularDamping("plugin unload");
+        alwaysOnGrids.Clear();
         const string message = "Unloaded.";
         MyLog.Default.WriteLine($"[{Name}] {message}");
         WriteLifecycleLog(message);
+        FlushLifecycleLogSynchronously();
         Instance = null;
     }
 
@@ -156,18 +188,17 @@ public sealed class Plugin : IPlugin
         EnsureChatHook();
 
         var controlledGrid = MySession.Static?.ControlledGrid;
+        RegisterAlwaysOnGridIfConfigured(controlledGrid);
         UpdateInertiaMode(controlledGrid);
         UpdateRcsVisuals(controlledGrid);
         UpdateAttitudeControl(controlledGrid);
         UpdateRotationalDampening(controlledGrid);
+        UpdateManualOverrideTorque(controlledGrid);
+        UpdateAlwaysOnGrids(controlledGrid);
 
-        // SE runs this callback every simulation frame. Sample once every
-        // 300 frames (about five seconds at the nominal 60 Hz rate) to keep
-        // the Phase 0 log readable and avoid a per-tick diagnostic cost.
-        if (updateCount % 300 != 0)
-            return;
+        if (updateCount % LifecycleLogFlushFrames == 0)
+            QueueLifecycleLogFlush();
 
-        LogControlledGrid();
     }
 
     private void EnsureChatHook()
@@ -231,6 +262,7 @@ public sealed class Plugin : IPlugin
             DisarmAttitudeControl("master ACS control disarmed by chat command");
             inertiaModeEnabled = false;
             RestoreAngularDamping("master ACS control disarmed by chat command");
+            RestoreAlwaysOnAngularDamping("master ACS control disarmed by chat command");
             return;
         }
 
@@ -245,7 +277,7 @@ public sealed class Plugin : IPlugin
         attitudeControlArmed = true;
         attitudeControlGridId = 0;
         inertiaModeEnabled = true;
-        const string armed = "ACS armed: finite RCS/vanilla-thruster attitude control, persistent inertia, and rotational dampening are enabled for the controlled grid.";
+        const string armed = "ACS armed: finite RCS plus virtual vanilla-thruster-geometry attitude control, persistent inertia, and rotational dampening are enabled for the controlled grid.";
         WriteLifecycleLog(armed);
         ShowChatFeedback(armed);
     }
@@ -286,6 +318,7 @@ public sealed class Plugin : IPlugin
         {
             inertiaModeEnabled = false;
             RestoreAngularDamping("disabled by chat command");
+            RestoreAlwaysOnAngularDamping("disabled by chat command");
             WriteLifecycleLog("Persistent-inertia experiment disabled.");
             ShowChatFeedback("ACS persistent-inertia experiment disabled.");
             return;
@@ -330,7 +363,7 @@ public sealed class Plugin : IPlugin
         {
             attitudeControlArmed = true;
             attitudeControlGridId = 0;
-            const string armed = "ACS finite ion-RCS attitude control armed at each cluster's rated torque. Turn vanilla gyros off; only working ACS RCS blocks contribute while you hold a rotation input.";
+            const string armed = "ACS attitude control armed. Turn vanilla gyros off; working RCS blocks and powered vanilla-thruster geometry provide finite virtual attitude authority while you hold a rotation input.";
             WriteLifecycleLog(armed);
             ShowChatFeedback(armed);
             return;
@@ -362,22 +395,24 @@ public sealed class Plugin : IPlugin
             || (Math.Abs(pitchPercent) < 0.001 && Math.Abs(yawPercent) < 0.001 && Math.Abs(rollPercent) < 0.001))
             return;
 
-        bool hasRcsAllocation = TryCalculateRcsForceAllocation(
-            controlledGrid, pitchPercent, yawPercent, rollPercent, out RcsForceAllocation rcsAllocation);
-        bool hasVanillaAllocation = TryCalculateWholeGridAllocation(
-            controlledGrid, pitchPercent, yawPercent, rollPercent, out AllocationResult vanillaAllocation);
+        GetCachedControlAllocations(
+            attitudeAllocationCache, controlledGrid, pitchPercent, yawPercent, rollPercent,
+            out bool hasRcsAllocation, out RcsForceAllocation rcsAllocation,
+            out bool hasVanillaAllocation, out AllocationResult vanillaAllocation);
         double rcsAlignment = hasRcsAllocation ? GetTorqueAlignment(rcsAllocation.RequestedTorque, rcsAllocation.AchievedTorque) : 0;
         double vanillaAlignment = hasVanillaAllocation ? GetTorqueAlignment(vanillaAllocation.RequestedTorque, vanillaAllocation.AchievedTorque) : 0;
+        double rcsResidual = hasRcsAllocation ? GetTranslationResidualRatio(rcsAllocation.TranslationResidual, rcsAllocation.ForceCapacity) : double.PositiveInfinity;
+        double vanillaResidual = hasVanillaAllocation ? GetTranslationResidualRatio(vanillaAllocation.TranslationResidual, vanillaAllocation.ForceCapacity) : double.PositiveInfinity;
         Vector3D combinedTorque = Vector3D.Zero;
-        if (hasRcsAllocation && rcsAlignment >= RcsMinimumTorqueAlignment)
+        if (hasRcsAllocation && rcsAlignment >= RcsMinimumTorqueAlignment && rcsResidual <= MaximumTranslationResidualRatio)
             combinedTorque += rcsAllocation.AchievedTorque * LiveAttitudeTorqueScale;
-        if (hasVanillaAllocation && vanillaAlignment >= RcsMinimumTorqueAlignment)
+        if (hasVanillaAllocation && vanillaAlignment >= RcsMinimumTorqueAlignment && vanillaResidual <= MaximumTranslationResidualRatio)
             combinedTorque += vanillaAllocation.AchievedTorque * VanillaAttitudeTorqueScale;
 
         if (combinedTorque.LengthSquared() <= 1)
         {
             if (updateCount % 60 == 0)
-                WriteLifecycleLog($"ACS attitude control withheld unavailable torque: RCS alignment {rcsAlignment:F2}; vanilla alignment {vanillaAlignment:F2}.");
+                WriteLifecycleLog($"ACS attitude control withheld an unbalanced virtual wrench: RCS alignment/residual {rcsAlignment:F2}/{rcsResidual:P1}; vanilla alignment/residual {vanillaAlignment:F2}/{vanillaResidual:P1}.");
             return;
         }
 
@@ -396,7 +431,7 @@ public sealed class Plugin : IPlugin
             WriteLifecycleLog(
                 $"ACS finite RCS attitude control — pilot request pitch/yaw/roll: {pitchPercent:F1}% / {yawPercent:F1}% / {rollPercent:F1}%; "
                 + $"RCS torque/alignment: {(hasRcsAllocation ? rcsAllocation.AchievedTorque.ToString() : "unavailable")}/{rcsAlignment:F2}; "
-                + $"vanilla torque/alignment: {(hasVanillaAllocation ? vanillaAllocation.AchievedTorque.ToString() : "unavailable")}/{vanillaAlignment:F2}; "
+                + $"vanilla torque/alignment: {(hasVanillaAllocation ? vanillaAllocation.AchievedTorque.ToString() : "unavailable")}/{vanillaAlignment:F2}; residual RCS/vanilla: {rcsResidual:P1}/{vanillaResidual:P1}; "
                 + $"combined applied torque: {appliedTorque}."
             );
         }
@@ -407,12 +442,46 @@ public sealed class Plugin : IPlugin
         bool wasArmed = attitudeControlArmed;
         attitudeControlArmed = false;
         attitudeControlGridId = 0;
+        RestoreHydrogenRcsOverrides(reason);
         if (!wasArmed)
             return;
 
         string message = $"ACS finite RCS attitude control disarmed ({reason}).";
         WriteLifecycleLog(message);
         ShowChatFeedback(message);
+    }
+
+    private void GetCachedControlAllocations(
+        ControlAllocationCache cache,
+        MyCubeGrid grid,
+        double pitchPercent,
+        double yawPercent,
+        double rollPercent,
+        out bool hasRcsAllocation,
+        out RcsForceAllocation rcsAllocation,
+        out bool hasVanillaAllocation,
+        out AllocationResult vanillaAllocation)
+    {
+        bool inputChanged = Math.Abs(cache.PitchPercent - pitchPercent) > AllocationInputChangeThresholdPercent
+            || Math.Abs(cache.YawPercent - yawPercent) > AllocationInputChangeThresholdPercent
+            || Math.Abs(cache.RollPercent - rollPercent) > AllocationInputChangeThresholdPercent;
+        if (cache.GridId != grid.EntityId
+            || inputChanged
+            || updateCount - cache.LastSolveFrame >= AllocationSolveIntervalFrames)
+        {
+            cache.GridId = grid.EntityId;
+            cache.PitchPercent = pitchPercent;
+            cache.YawPercent = yawPercent;
+            cache.RollPercent = rollPercent;
+            cache.LastSolveFrame = updateCount;
+            cache.HasRcsAllocation = TryCalculateRcsForceAllocation(grid, pitchPercent, yawPercent, rollPercent, out cache.RcsAllocation);
+            cache.HasVanillaAllocation = TryCalculateWholeGridAllocation(grid, pitchPercent, yawPercent, rollPercent, out cache.VanillaAllocation);
+        }
+
+        hasRcsAllocation = cache.HasRcsAllocation;
+        rcsAllocation = cache.RcsAllocation;
+        hasVanillaAllocation = cache.HasVanillaAllocation;
+        vanillaAllocation = cache.VanillaAllocation;
     }
 
     private void SetRotationalDampeningMode(string command)
@@ -448,24 +517,22 @@ public sealed class Plugin : IPlugin
         // grid.  Do not dereference it while clearing the previous session state.
         if (controlledGrid == null)
         {
+            RestoreHydrogenRcsOverrides("control ended");
             rcsVisualStates.Clear();
             rcsVisualAllocatedForces.Clear();
             rcsVisualAllocationGridId = 0;
             return;
         }
 
+        if (hydrogenOverrideGridId != 0 && hydrogenOverrideGridId != controlledGrid.EntityId)
+            RestoreHydrogenRcsOverrides("controlled grid changed");
+
         // Initialize the authored force axes before planning.  The planner needs
         // each pod's neutral, mounted direction in order to honour its cone.
-        var rcsBlocks = new List<MyCubeBlock>();
-        foreach (var slimBlock in controlledGrid.GetBlocks())
+        GridActuatorCache actuatorCache = GetGridActuatorCache(controlledGrid);
+        var rcsBlocks = actuatorCache.RcsBlocks;
+        foreach (MyCubeBlock rcsBlock in rcsBlocks)
         {
-            if (!(slimBlock.FatBlock is MyCubeBlock rcsBlock)
-                || !IsCustomRcsBlock(rcsBlock))
-            {
-                continue;
-            }
-
-            rcsBlocks.Add(rcsBlock);
             if (!rcsVisualStates.TryGetValue(rcsBlock.EntityId, out RcsVisualState state))
             {
                 state = new RcsVisualState();
@@ -573,10 +640,17 @@ public sealed class Plugin : IPlugin
                 if (withinPhysicalCone || (rcsSharedVectorProbeActive && IsRcsProbeBlock(rcsBlock)))
                 {
                     // The nozzle/exhaust points opposite the selected thrust vector.
-                    state.DesiredNozzleWorld = -thrustWorld;
-                    SolveRcsGimbalPose(state, rcsBlock.WorldMatrix, state.DesiredNozzleWorld, out float targetAzimuth, out float targetElevation);
-                    state.AzimuthRadians = MoveRcsVisualAxis(state.AzimuthRadians, targetAzimuth);
-                    state.ElevationRadians = MoveRcsVisualAxis(state.ElevationRadians, targetElevation);
+                    Vector3D desiredNozzleWorld = -thrustWorld;
+                    if (state.DesiredNozzleWorld.LengthSquared() <= 0
+                        || Vector3D.Dot(state.DesiredNozzleWorld, desiredNozzleWorld) < 0.9999)
+                    {
+                        state.DesiredNozzleWorld = desiredNozzleWorld;
+                        SolveRcsGimbalPose(state, rcsBlock.WorldMatrix, state.DesiredNozzleWorld, out float targetAzimuth, out float targetElevation);
+                        state.TargetAzimuthRadians = targetAzimuth;
+                        state.TargetElevationRadians = targetElevation;
+                    }
+                    state.AzimuthRadians = MoveRcsVisualAxis(state.AzimuthRadians, state.TargetAzimuthRadians);
+                    state.ElevationRadians = MoveRcsVisualAxis(state.ElevationRadians, state.TargetElevationRadians);
                 }
                 else
                 {
@@ -603,8 +677,14 @@ public sealed class Plugin : IPlugin
 
     private void UpdateHydrogenRcsFuelDemand(MyCubeBlock rcsBlock)
     {
-        if (!IsHydrogenRcsBlock(rcsBlock) || !(rcsBlock is IMyThrust hydrogenRcs))
+        if (!attitudeControlArmed || !IsHydrogenRcsBlock(rcsBlock) || !(rcsBlock is IMyThrust hydrogenRcs))
             return;
+
+        if (!hydrogenOverrides.ContainsKey(rcsBlock.EntityId))
+        {
+            hydrogenOverrides.Add(rcsBlock.EntityId, new HydrogenOverrideState(hydrogenRcs, hydrogenRcs.ThrustOverridePercentage));
+            hydrogenOverrideGridId = rcsBlock.CubeGrid.EntityId;
+        }
 
         double demand = rcsVisualAllocatedForces.TryGetValue(rcsBlock.EntityId, out Vector3D force)
             ? Clamp(force.Length() / GetRcsMaximumForce(rcsBlock), 0, 1)
@@ -613,6 +693,51 @@ public sealed class Plugin : IPlugin
         // drives its hydrogen converter at the allocated duty cycle without
         // introducing meaningful translation force.
         hydrogenRcs.ThrustOverridePercentage = (float)demand;
+    }
+
+    private void RestoreHydrogenRcsOverrides(string reason)
+    {
+        if (hydrogenOverrides.Count == 0)
+            return;
+
+        foreach (HydrogenOverrideState state in hydrogenOverrides.Values)
+        {
+            try
+            {
+                state.Thruster.ThrustOverridePercentage = state.OriginalOverridePercentage;
+            }
+            catch
+            {
+                // A block may already have closed while changing worlds.
+            }
+        }
+
+        hydrogenOverrides.Clear();
+        hydrogenOverrideGridId = 0;
+        WriteLifecycleLog($"Restored original hydrogen RCS thrust overrides ({reason}).");
+    }
+
+    private GridActuatorCache GetGridActuatorCache(MyCubeGrid grid)
+    {
+        if (!actuatorCaches.TryGetValue(grid.EntityId, out GridActuatorCache cache)
+            || updateCount - cache.LastRefreshFrame >= ActuatorCacheRefreshFrames)
+        {
+            cache ??= new GridActuatorCache(grid.EntityId);
+            cache.RcsBlocks.Clear();
+            cache.VanillaThrusters.Clear();
+            foreach (var slimBlock in grid.GetBlocks())
+            {
+                if (slimBlock.FatBlock is MyCubeBlock cubeBlock && IsCustomRcsBlock(cubeBlock))
+                    cache.RcsBlocks.Add(cubeBlock);
+                if (slimBlock.FatBlock is MyThrust thruster)
+                    cache.VanillaThrusters.Add(thruster);
+            }
+
+            cache.LastRefreshFrame = updateCount;
+            actuatorCaches[grid.EntityId] = cache;
+        }
+
+        return cache;
     }
 
     private void LogRcsVisualAlignment()
@@ -859,11 +984,9 @@ public sealed class Plugin : IPlugin
         MatrixD controlFrame = (MySession.Static?.ControlledEntity as MyCockpit)?.WorldMatrix ?? grid.WorldMatrix;
         var grossTorqueByAxis = new double[3];
 
-        foreach (var slimBlock in grid.GetBlocks())
+        foreach (MyCubeBlock rcsBlock in GetGridActuatorCache(grid).RcsBlocks)
         {
-            if (!(slimBlock.FatBlock is MyCubeBlock rcsBlock)
-                || !IsCustomRcsBlock(rcsBlock)
-                || !rcsBlock.IsWorking
+            if (!rcsBlock.IsWorking
                 || !rcsVisualStates.TryGetValue(rcsBlock.EntityId, out RcsVisualState state)
                 || !state.Initialized)
             {
@@ -903,7 +1026,7 @@ public sealed class Plugin : IPlugin
             forcesByBlock[pod.EntityId] = force;
         }
 
-        allocation = new RcsForceAllocation(requestedTorque, achievedTorque, translationResidual, forcesByBlock);
+        allocation = new RcsForceAllocation(requestedTorque, achievedTorque, translationResidual, forceScale, forcesByBlock);
         return true;
     }
 
@@ -941,6 +1064,11 @@ public sealed class Plugin : IPlugin
             return 0;
 
         return Vector3D.Dot(requestedTorque, achievedTorque) / (requestedLength * achievedLength);
+    }
+
+    private static double GetTranslationResidualRatio(Vector3D translationResidual, double forceCapacity)
+    {
+        return forceCapacity <= 1e-6 ? double.PositiveInfinity : translationResidual.Length() / forceCapacity;
     }
 
     private static void SolveRcsConeAllocation(List<RcsConePod> pods, Vector3D targetTorque, double forceScale, double torqueScale)
@@ -1051,7 +1179,6 @@ public sealed class Plugin : IPlugin
     {
         // A fixed cone map is independent of the last visual pose, avoiding
         // history-dependent results for pods rolled around their thrust axis.
-        const float poseStep = MathHelper.Pi / 36f; // five degrees
         // Convert the requested world-space nozzle direction into this specific
         // block's local frame before choosing its two local gimbal axes.
         MatrixD inverseBlockWorld = MatrixD.Invert(parentWorldMatrix);
@@ -1060,21 +1187,14 @@ public sealed class Plugin : IPlugin
         float bestAzimuth = 0;
         float bestElevation = 0;
         double bestScore = Vector3D.Dot(-neutralForceLocal, desiredNozzleLocal);
-        for (float azimuth = -RcsMaximumAzimuthRadians; azimuth <= RcsMaximumAzimuthRadians + 0.001f; azimuth += poseStep)
-        for (float elevation = -RcsMaximumElevationRadians; elevation <= RcsMaximumElevationRadians + 0.001f; elevation += poseStep)
+        foreach (RcsPoseCandidate candidate in state.PoseCandidates)
         {
-            Vector3D forceLocal = GetRcsPoseForceLocal(state, azimuth, elevation);
-            // Keep the intended limit circular even though the two gimbal axes
-            // have their own individual angular ranges.
-            if (Vector3D.Dot(forceLocal, neutralForceLocal) < RcsConeMinimumAlignment)
-                continue;
-
-            double score = Vector3D.Dot(-forceLocal, desiredNozzleLocal);
+            double score = Vector3D.Dot(-candidate.ForceLocal, desiredNozzleLocal);
             if (score > bestScore)
             {
                 bestScore = score;
-                bestAzimuth = azimuth;
-                bestElevation = elevation;
+                bestAzimuth = candidate.AzimuthRadians;
+                bestElevation = candidate.ElevationRadians;
             }
         }
 
@@ -1128,12 +1248,26 @@ public sealed class Plugin : IPlugin
             // Blender explicitly defines this dummy's local +Z as force. In SE's
             // matrix convention Backward is +Z, so its inverse is nozzle exhaust.
             state.ForceAxisElevationLocal = Vector3D.Normalize(forceAxisDummy.Matrix.Backward);
+            BuildRcsPoseCandidates(state);
             state.Initialized = true;
             WriteLifecycleLog($"ACS RCS visual hierarchy initialized for block {rcsBlock.EntityId}: main → azimuth → elevation.");
         }
         catch (Exception exception)
         {
             WriteLifecycleLog($"ACS RCS visual setup failed for {rcsBlock.EntityId}: {exception.GetType().Name}: {exception.Message}");
+        }
+    }
+
+    private static void BuildRcsPoseCandidates(RcsVisualState state)
+    {
+        const float poseStep = MathHelper.Pi / 36f; // five degrees
+        Vector3D neutralForceLocal = GetRcsPoseForceLocal(state, 0, 0);
+        for (float azimuth = -RcsMaximumAzimuthRadians; azimuth <= RcsMaximumAzimuthRadians + 0.001f; azimuth += poseStep)
+        for (float elevation = -RcsMaximumElevationRadians; elevation <= RcsMaximumElevationRadians + 0.001f; elevation += poseStep)
+        {
+            Vector3D forceLocal = GetRcsPoseForceLocal(state, azimuth, elevation);
+            if (Vector3D.Dot(forceLocal, neutralForceLocal) >= RcsConeMinimumAlignment)
+                state.PoseCandidates.Add(new RcsPoseCandidate(azimuth, elevation, forceLocal));
         }
     }
 
@@ -1188,16 +1322,18 @@ public sealed class Plugin : IPlugin
         if (Math.Abs(pitchPercent) < 0.001 && Math.Abs(yawPercent) < 0.001 && Math.Abs(rollPercent) < 0.001)
             return;
 
-        bool hasRcsAllocation = TryCalculateRcsForceAllocation(
-            controlledGrid, pitchPercent, yawPercent, rollPercent, out RcsForceAllocation rcsAllocation);
-        bool hasVanillaAllocation = TryCalculateWholeGridAllocation(
-            controlledGrid, pitchPercent, yawPercent, rollPercent, out AllocationResult vanillaAllocation);
+        GetCachedControlAllocations(
+            dampeningAllocationCache, controlledGrid, pitchPercent, yawPercent, rollPercent,
+            out bool hasRcsAllocation, out RcsForceAllocation rcsAllocation,
+            out bool hasVanillaAllocation, out AllocationResult vanillaAllocation);
         double rcsAlignment = hasRcsAllocation ? GetTorqueAlignment(rcsAllocation.RequestedTorque, rcsAllocation.AchievedTorque) : 0;
         double vanillaAlignment = hasVanillaAllocation ? GetTorqueAlignment(vanillaAllocation.RequestedTorque, vanillaAllocation.AchievedTorque) : 0;
+        double rcsResidual = hasRcsAllocation ? GetTranslationResidualRatio(rcsAllocation.TranslationResidual, rcsAllocation.ForceCapacity) : double.PositiveInfinity;
+        double vanillaResidual = hasVanillaAllocation ? GetTranslationResidualRatio(vanillaAllocation.TranslationResidual, vanillaAllocation.ForceCapacity) : double.PositiveInfinity;
         Vector3D combinedTorque = Vector3D.Zero;
-        if (hasRcsAllocation && rcsAlignment >= RcsMinimumTorqueAlignment)
+        if (hasRcsAllocation && rcsAlignment >= RcsMinimumTorqueAlignment && rcsResidual <= MaximumTranslationResidualRatio)
             combinedTorque += rcsAllocation.AchievedTorque;
-        if (hasVanillaAllocation && vanillaAlignment >= RcsMinimumTorqueAlignment)
+        if (hasVanillaAllocation && vanillaAlignment >= RcsMinimumTorqueAlignment && vanillaResidual <= MaximumTranslationResidualRatio)
             combinedTorque += vanillaAllocation.AchievedTorque;
         if (combinedTorque.LengthSquared() <= 1)
             return;
@@ -1209,7 +1345,7 @@ public sealed class Plugin : IPlugin
             WriteLifecycleLog(
                 $"ACS rotational dampening — mode: {rotationalDampeningMode.ToString().ToLowerInvariant()}; "
                 + $"counter-request pitch/yaw/roll: {pitchPercent:F1}% / {yawPercent:F1}% / {rollPercent:F1}%; "
-                + $"RCS/vanilla alignment: {rcsAlignment:F2}/{vanillaAlignment:F2}; "
+                + $"RCS/vanilla alignment/residual: {rcsAlignment:F2}/{vanillaAlignment:F2} / {rcsResidual:P1}/{vanillaResidual:P1}; "
                 + $"combined applied torque at {RotationalDampeningTorqueScale:P0}: {appliedTorque}; no thruster overrides were written."
             );
         }
@@ -1224,6 +1360,248 @@ public sealed class Plugin : IPlugin
         // arrest rotation. This preserves the player's normal SE expectation.
         bool shiftHeld = MyAPIGateway.Input?.IsAnyShiftKeyPressed() == true;
         return shiftHeld ? !dampeningRequested : dampeningRequested;
+    }
+
+    private void RegisterAlwaysOnGridIfConfigured(MyCubeGrid grid)
+    {
+        if (grid == null || alwaysOnGrids.ContainsKey(grid.EntityId))
+            return;
+
+        if (!TryGetAlwaysOnCockpit(grid, out MyCockpit cockpit, out string reason))
+        {
+            if (!string.IsNullOrEmpty(reason))
+                WriteLifecycleLog($"ACS AlwaysOn registration skipped for grid {grid.EntityId}: {reason}.");
+            return;
+        }
+
+        if (alwaysOnGrids.Count >= MaximumAlwaysOnGrids)
+        {
+            WriteLifecycleLog($"ACS AlwaysOn registration refused for grid {grid.EntityId}: limit of {MaximumAlwaysOnGrids} registered grids reached.");
+            return;
+        }
+
+        alwaysOnGrids.Add(grid.EntityId, new AlwaysOnGridRegistration(grid, cockpit.EntityId, updateCount + AlwaysOnValidationFrames));
+        WriteLifecycleLog($"ACS AlwaysOn registered grid {grid.EntityId} through vanilla Main Cockpit {cockpit.EntityId}.");
+    }
+
+    private void UpdateAlwaysOnGrids(MyCubeGrid controlledGrid)
+    {
+        if (alwaysOnGrids.Count == 0)
+            return;
+
+        var expired = new List<long>();
+        foreach (AlwaysOnGridRegistration registration in alwaysOnGrids.Values)
+        {
+            MyCubeGrid grid = registration.Grid;
+            if (grid == null || grid.MarkedForClose || grid.Closed)
+            {
+                expired.Add(registration.GridId);
+                continue;
+            }
+
+            if (registration.GridId == controlledGrid?.EntityId)
+                continue; // The controlled-grid path already applied this torque.
+
+            if (updateCount >= registration.NextValidationFrame)
+            {
+                if (!TryGetAlwaysOnCockpit(grid, out MyCockpit cockpit, out _)
+                    || cockpit.EntityId != registration.CockpitEntityId)
+                {
+                    expired.Add(registration.GridId);
+                    continue;
+                }
+
+                registration.NextValidationFrame = updateCount + AlwaysOnValidationFrames;
+            }
+
+            UpdateAlwaysOnInertia(registration);
+            UpdateManualOverrideTorque(grid);
+        }
+
+        foreach (long gridId in expired)
+        {
+            if (alwaysOnGrids.TryGetValue(gridId, out AlwaysOnGridRegistration registration))
+                RestoreAlwaysOnAngularDamping(registration, "registration expired");
+            alwaysOnGrids.Remove(gridId);
+            WriteLifecycleLog($"ACS AlwaysOn unregistered grid {gridId} after slow validation.");
+        }
+    }
+
+    private void UpdateAlwaysOnInertia(AlwaysOnGridRegistration registration)
+    {
+        if (!inertiaModeEnabled || registration.Grid.Physics == null)
+        {
+            RestoreAlwaysOnAngularDamping(registration, "inertia disabled or physics unavailable");
+            return;
+        }
+
+        if (!registration.AngularDampingOverridden)
+        {
+            registration.OriginalAngularDamping = registration.Grid.Physics.AngularDamping;
+            registration.AngularDampingOverridden = true;
+        }
+
+        registration.Grid.Physics.AngularDamping = 0;
+    }
+
+    private void RestoreAlwaysOnAngularDamping(string reason)
+    {
+        foreach (AlwaysOnGridRegistration registration in alwaysOnGrids.Values)
+            RestoreAlwaysOnAngularDamping(registration, reason);
+    }
+
+    private static void RestoreAlwaysOnAngularDamping(AlwaysOnGridRegistration registration, string reason)
+    {
+        if (!registration.AngularDampingOverridden)
+            return;
+
+        try
+        {
+            if (registration.Grid?.Physics != null)
+                registration.Grid.Physics.AngularDamping = registration.OriginalAngularDamping;
+        }
+        catch
+        {
+            // The grid can close before slow registration cleanup observes it.
+        }
+
+        registration.AngularDampingOverridden = false;
+        registration.OriginalAngularDamping = 0;
+    }
+
+    private static bool TryGetAlwaysOnCockpit(MyCubeGrid grid, out MyCockpit result, out string reason)
+    {
+        result = null;
+        reason = null;
+        var cockpits = new List<MyCockpit>();
+        foreach (var slimBlock in grid.GetBlocks())
+            if (slimBlock.FatBlock is MyCockpit cockpit)
+                cockpits.Add(cockpit);
+
+        if (cockpits.Count == 0)
+        {
+            reason = "no cockpit exists";
+            return false;
+        }
+
+        if (cockpits.Count == 1)
+            result = cockpits[0];
+        else
+        {
+            foreach (MyCockpit cockpit in cockpits)
+            {
+                if (!cockpit.IsMainCockpit)
+                    continue;
+                if (result != null)
+                {
+                    reason = "multiple vanilla Main Cockpits exist";
+                    return false;
+                }
+                result = cockpit;
+            }
+
+            if (result == null)
+            {
+                reason = "multiple cockpits exist but none is the vanilla Main Cockpit";
+                return false;
+            }
+        }
+
+        string customData = (result as IMyTerminalBlock)?.CustomData ?? string.Empty;
+        if (customData.IndexOf("AlwaysOn=true", StringComparison.OrdinalIgnoreCase) < 0)
+        {
+            reason = "the qualifying cockpit does not declare AlwaysOn=true";
+            result = null;
+            return false;
+        }
+
+        return true;
+    }
+
+    private void UpdateManualOverrideTorque(MyCubeGrid grid)
+    {
+        if (grid?.Physics?.RigidBody == null)
+            return;
+
+        Vector3D centerOfMass = grid.Physics.CenterOfMassWorld;
+        MatrixD gridWorldMatrix = grid.WorldMatrix;
+        Vector3D totalTorque = Vector3D.Zero;
+        foreach (MyThrust thruster in GetGridActuatorCache(grid).VanillaThrusters)
+        {
+            var api = (IMyThrust)thruster;
+            if (IsCustomRcsBlock(thruster) || !api.Enabled || !thruster.IsWorking || !thruster.IsPowered
+                || api.ThrustOverridePercentage <= 0.001f || api.CurrentThrust <= 0)
+            {
+                continue;
+            }
+
+            Vector3D maximumForceWorld = ToWorldVector(thruster.ThrustForce, gridWorldMatrix);
+            if (maximumForceWorld.LengthSquared() <= 0)
+                continue;
+
+            Vector3D forceWorld = Vector3D.Normalize(maximumForceWorld) * api.CurrentThrust;
+            totalTorque += Vector3D.Cross(thruster.PositionComp.GetPosition() - centerOfMass, forceWorld);
+        }
+
+        if (totalTorque.LengthSquared() <= 1)
+            return;
+
+        Vector3D appliedTorqueWorld = totalTorque;
+        if (ShouldArrestRotation(grid)
+            && TryCalculateOverrideCounterTorque(grid, totalTorque, out Vector3D counterTorque))
+        {
+            appliedTorqueWorld += counterTorque;
+        }
+
+        Vector3 appliedTorque = ToVector3(appliedTorqueWorld);
+        Vector3 angularVelocity = grid.Physics.RigidBody.AngularVelocity;
+        if (angularVelocity.Length() >= AngularSpeedSafetyLimit && Vector3.Dot(angularVelocity, appliedTorque) > 0)
+            return;
+
+        grid.Physics.RigidBody.ApplyTorque(NominalSimulationStepSeconds, appliedTorque);
+    }
+
+    private bool TryCalculateOverrideCounterTorque(MyCubeGrid grid, Vector3D disturbanceTorque, out Vector3D counterTorque)
+    {
+        counterTorque = Vector3D.Zero;
+        MatrixD controlFrame = (MySession.Static?.ControlledEntity as MyCockpit)?.WorldMatrix ?? grid.WorldMatrix;
+        double largestComponent = Math.Max(
+            Math.Abs(Vector3D.Dot(disturbanceTorque, controlFrame.Right)),
+            Math.Max(Math.Abs(Vector3D.Dot(disturbanceTorque, controlFrame.Up)), Math.Abs(Vector3D.Dot(disturbanceTorque, controlFrame.Forward))));
+        if (largestComponent <= 1e-6)
+            return false;
+
+        double pitchPercent = Clamp(-Vector3D.Dot(disturbanceTorque, controlFrame.Right) / largestComponent, -1, 1) * PilotInputMaximumTorquePercent;
+        double yawPercent = Clamp(-Vector3D.Dot(disturbanceTorque, controlFrame.Up) / largestComponent, -1, 1) * PilotInputMaximumTorquePercent;
+        double rollPercent = Clamp(-Vector3D.Dot(disturbanceTorque, controlFrame.Forward) / largestComponent, -1, 1) * PilotInputMaximumTorquePercent;
+        GetCachedControlAllocations(
+            overrideCounterAllocationCache, grid, pitchPercent, yawPercent, rollPercent,
+            out bool hasRcsAllocation, out RcsForceAllocation rcsAllocation,
+            out bool hasVanillaAllocation, out AllocationResult vanillaAllocation);
+
+        Vector3D requestedCounter = -disturbanceTorque;
+        Vector3D availableCounter = Vector3D.Zero;
+        if (hasRcsAllocation
+            && GetTorqueAlignment(requestedCounter, rcsAllocation.AchievedTorque) >= RcsMinimumTorqueAlignment
+            && GetTranslationResidualRatio(rcsAllocation.TranslationResidual, rcsAllocation.ForceCapacity) <= MaximumTranslationResidualRatio)
+        {
+            availableCounter += rcsAllocation.AchievedTorque;
+        }
+        if (hasVanillaAllocation
+            && GetTorqueAlignment(requestedCounter, vanillaAllocation.AchievedTorque) >= RcsMinimumTorqueAlignment
+            && GetTranslationResidualRatio(vanillaAllocation.TranslationResidual, vanillaAllocation.ForceCapacity) <= MaximumTranslationResidualRatio)
+        {
+            availableCounter += vanillaAllocation.AchievedTorque;
+        }
+
+        if (availableCounter.LengthSquared() <= 1)
+            return false;
+
+        // The allocator establishes a feasible counter direction. Scale it so
+        // it cannot over-correct the manual override disturbance in one step.
+        double scale = Math.Min(1, disturbanceTorque.Length() / availableCounter.Length());
+        counterTorque = availableCounter * scale;
+        return true;
     }
 
     private void UpdateInertiaMode(MyCubeGrid controlledGrid)
@@ -1729,7 +2107,10 @@ public sealed class Plugin : IPlugin
                 continue;
 
             var api = (IMyThrust)thruster;
-            if (!thruster.IsPowered || api.MaxEffectiveThrust <= 0)
+            // A terminal-disabled thruster can retain a powered resource sink
+            // and non-zero effective capacity. It must not supply virtual ACS
+            // authority unless it is explicitly enabled and working.
+            if (!api.Enabled || !thruster.IsWorking || !thruster.IsPowered || api.MaxEffectiveThrust <= 0)
                 continue;
 
             Vector3D maximumForceWorld = ToWorldVector(thruster.ThrustForce, gridWorldMatrix);
@@ -1820,7 +2201,7 @@ public sealed class Plugin : IPlugin
             ShowChatFeedback("Whole-grid allocation plan logged. No thrust was changed.");
     }
 
-    private static bool TryCalculateWholeGridAllocation(
+    private bool TryCalculateWholeGridAllocation(
         MyCubeGrid grid,
         double pitchPercent,
         double yawPercent,
@@ -1838,13 +2219,14 @@ public sealed class Plugin : IPlugin
         double forceScale = 0;
         var grossTorqueByAxis = new double[3];
 
-        foreach (var block in grid.GetBlocks())
+        foreach (MyThrust thruster in GetGridActuatorCache(grid).VanillaThrusters)
         {
-            if (!(block.FatBlock is MyThrust thruster))
-                continue;
-
             var api = (IMyThrust)thruster;
-            if (!thruster.IsPowered || api.MaxEffectiveThrust <= 0)
+            bool enabled = api.Enabled;
+            bool working = thruster.IsWorking;
+            bool powered = thruster.IsPowered;
+            bool effective = api.MaxEffectiveThrust > 0;
+            if (!enabled || !working || !powered || !effective)
                 continue;
 
             Vector3D maximumForceWorld = ToWorldVector(thruster.ThrustForce, gridWorldMatrix);
@@ -1889,7 +2271,7 @@ public sealed class Plugin : IPlugin
             translationResidual += candidate.ForceDirection * candidate.MaximumThrust * candidate.ThrottleDelta;
         }
 
-        result = new AllocationResult(requestedTorque, achievedTorque, translationResidual);
+        result = new AllocationResult(requestedTorque, achievedTorque, translationResidual, forceScale);
         return true;
     }
 
@@ -1904,7 +2286,7 @@ public sealed class Plugin : IPlugin
         // Coordinate descent uses the exact curvature for each throttle variable.
         // Unlike a fixed-step gradient, it converges reliably when force and torque
         // columns have very different scales or the requested axis is weak.
-        for (int iteration = 0; iteration < 800; iteration++)
+        for (int iteration = 0; iteration < MaximumVanillaAllocationIterations; iteration++)
         {
             double largestChange = 0;
             foreach (var candidate in candidates)
@@ -2226,6 +2608,53 @@ public sealed class Plugin : IPlugin
         public Vector3D DesiredNozzleWorld;
         public float AzimuthRadians;
         public float ElevationRadians;
+        public float TargetAzimuthRadians;
+        public float TargetElevationRadians;
+        public List<RcsPoseCandidate> PoseCandidates { get; } = new();
+    }
+
+    private readonly struct RcsPoseCandidate(float azimuthRadians, float elevationRadians, Vector3D forceLocal)
+    {
+        public float AzimuthRadians { get; } = azimuthRadians;
+        public float ElevationRadians { get; } = elevationRadians;
+        public Vector3D ForceLocal { get; } = forceLocal;
+    }
+
+    private sealed class HydrogenOverrideState(IMyThrust thruster, float originalOverridePercentage)
+    {
+        public IMyThrust Thruster { get; } = thruster;
+        public float OriginalOverridePercentage { get; } = originalOverridePercentage;
+    }
+
+    private sealed class GridActuatorCache(long gridId)
+    {
+        public long GridId { get; } = gridId;
+        public long LastRefreshFrame { get; set; } = long.MinValue;
+        public List<MyCubeBlock> RcsBlocks { get; } = new();
+        public List<MyThrust> VanillaThrusters { get; } = new();
+    }
+
+    private sealed class AlwaysOnGridRegistration(MyCubeGrid grid, long cockpitEntityId, long nextValidationFrame)
+    {
+        public long GridId { get; } = grid.EntityId;
+        public MyCubeGrid Grid { get; } = grid;
+        public long CockpitEntityId { get; } = cockpitEntityId;
+        public long NextValidationFrame { get; set; } = nextValidationFrame;
+        public bool AngularDampingOverridden { get; set; }
+        public float OriginalAngularDamping { get; set; }
+    }
+
+    private sealed class ControlAllocationCache
+    {
+        public long GridId;
+        public long LastSolveFrame = long.MinValue;
+        public double PitchPercent;
+        public double YawPercent;
+        public double RollPercent;
+        public bool HasRcsAllocation;
+        public bool HasVanillaAllocation;
+        public RcsForceAllocation RcsAllocation;
+        public AllocationResult VanillaAllocation;
     }
 
     private readonly struct ThrusterSample(
@@ -2290,22 +2719,26 @@ public sealed class Plugin : IPlugin
     private readonly struct AllocationResult(
         Vector3D requestedTorque,
         Vector3D achievedTorque,
-        Vector3D translationResidual)
+        Vector3D translationResidual,
+        double forceCapacity)
     {
         public Vector3D RequestedTorque { get; } = requestedTorque;
         public Vector3D AchievedTorque { get; } = achievedTorque;
         public Vector3D TranslationResidual { get; } = translationResidual;
+        public double ForceCapacity { get; } = forceCapacity;
     }
 
     private readonly struct RcsForceAllocation(
         Vector3D requestedTorque,
         Vector3D achievedTorque,
         Vector3D translationResidual,
+        double forceCapacity,
         Dictionary<long, Vector3D> forcesByBlock)
     {
         public Vector3D RequestedTorque { get; } = requestedTorque;
         public Vector3D AchievedTorque { get; } = achievedTorque;
         public Vector3D TranslationResidual { get; } = translationResidual;
+        public double ForceCapacity { get; } = forceCapacity;
         public Dictionary<long, Vector3D> ForcesByBlock { get; } = forcesByBlock;
     }
 
@@ -2341,14 +2774,72 @@ public sealed class Plugin : IPlugin
         public double ReductionPercent { get; } = reductionPercent;
     }
 
-    private static void WriteLifecycleLog(string message)
+    private static void InitializeLifecycleLogPath()
     {
         try
         {
-            string assemblyPath = Assembly.GetExecutingAssembly().Location;
-            string directory = Path.GetDirectoryName(assemblyPath);
-            string logPath = Path.Combine(directory, "realistic-acs.log");
-            File.AppendAllText(logPath, $"{DateTime.UtcNow:O} [{Name}] {message}{Environment.NewLine}");
+            string directory = Path.Combine(MyFileSystem.UserDataPath, "RealisticAcs");
+            Directory.CreateDirectory(directory);
+            lifecycleLogPath = Path.Combine(directory, "realistic-acs.log");
+        }
+        catch
+        {
+            lifecycleLogPath = null;
+        }
+    }
+
+    private static void WriteLifecycleLog(string message)
+    {
+        PendingLifecycleLogLines.Enqueue($"{DateTime.UtcNow:O} [{Name}] {message}{Environment.NewLine}");
+    }
+
+    private static void QueueLifecycleLogFlush()
+    {
+        if (string.IsNullOrEmpty(lifecycleLogPath) || PendingLifecycleLogLines.IsEmpty
+            || System.Threading.Interlocked.Exchange(ref lifecycleLogFlushScheduled, 1) != 0)
+            return;
+
+        System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+        {
+            try { FlushLifecycleLog(); }
+            finally { System.Threading.Interlocked.Exchange(ref lifecycleLogFlushScheduled, 0); }
+        });
+    }
+
+    private static void FlushLifecycleLogSynchronously()
+    {
+        if (string.IsNullOrEmpty(lifecycleLogPath))
+            return;
+
+        lock (LifecycleLogFileLock)
+            FlushLifecycleLogCore();
+    }
+
+    private static void FlushLifecycleLog()
+    {
+        lock (LifecycleLogFileLock)
+            FlushLifecycleLogCore();
+    }
+
+    private static void FlushLifecycleLogCore()
+    {
+        try
+        {
+            var batch = new System.Text.StringBuilder();
+            while (PendingLifecycleLogLines.TryDequeue(out string line))
+                batch.Append(line);
+            if (batch.Length == 0)
+                return;
+
+            if (File.Exists(lifecycleLogPath) && new FileInfo(lifecycleLogPath).Length >= LifecycleLogMaximumBytes)
+            {
+                string previousPath = lifecycleLogPath + ".previous";
+                if (File.Exists(previousPath))
+                    File.Delete(previousPath);
+                File.Move(lifecycleLogPath, previousPath);
+            }
+
+            File.AppendAllText(lifecycleLogPath, batch.ToString());
         }
         catch
         {
